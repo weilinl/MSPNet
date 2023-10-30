@@ -13,7 +13,6 @@ import scipy.io as sio
 import matplotlib.pyplot as plt
 import time
 from glob import glob
-from stego.Mython2.LWENet import lwenet
 
 import torch
 import torch.nn as nn
@@ -118,70 +117,9 @@ class CBR(nn.Module):
     return x
 
 
-class TCBR(nn.Module):
-  def __init__(self, in_dim, out_dim):
-    super(TCBR, self).__init__()
-
-    self.conv = nn.ConvTranspose2d(in_dim, out_dim, kernel_size=3, padding=1, stride=2, output_padding=1, bias=False)
-    self.bn = nn.BatchNorm2d(out_dim)
-    self.act = nn.ReLU()
-
-  def forward(self, x):
-    x = self.conv(x)
-    x = self.bn(x)
-    x = self.act(x)
-
-    return x
-
-
-
-class CFBlock(nn.Module):
+class SFEBlock(nn.Module):
   def __init__(self, in_channels):
-    super(CFBlock, self).__init__()
-
-    self.conv1 = CBR(in_channels, in_channels)
-    self.conv2 = CBR(in_channels, in_channels)
-    self.conv3 = CBR(in_channels, in_channels)
-    self.avg = nn.AvgPool2d(kernel_size=3, padding=1, stride=2)
-    self.tconv1 = TCBR(in_channels, in_channels)
-    self.tconv2 = TCBR(in_channels, in_channels)
-
-  def forward(self, input):
-    out1 = self.conv1(input)
-    out = self.avg(out1)
-    out2 = self.conv2(out)
-    out = self.avg(out2)
-    out3 = self.conv3(out)
-    out3 = self.conv3(out3)
-    outt2 = self.tconv1(out3)
-    out = outt2 + out2
-    outt1 = self.tconv2(out)
-    out = outt1 + out1
-    return out, out3
-
-
-class CFBlock2(nn.Module):
-  def __init__(self, in_channels):
-    super(CFBlock2, self).__init__()
-
-    self.conv1 = CBR(in_channels, in_channels)
-    self.conv2 = CBR(in_channels, in_channels)
-    self.conv3 = CBR(in_channels, in_channels)
-    self.avg = nn.AvgPool2d(kernel_size=3, padding=1, stride=2)
-
-
-  def forward(self, input):
-    out = self.conv1(input)
-    out = self.avg(out)
-    out = self.conv2(out)
-    out = self.avg(out)
-    out = self.conv3(out)
-    return out
-
-
-class CFBlock3(nn.Module):
-  def __init__(self, in_channels):
-    super(CFBlock3, self).__init__()
+    super(SFEBlock, self).__init__()
 
     self.conv1 = CBR(in_channels, 2 * in_channels)
     self.conv1s = CBR(2 * in_channels, 2 * in_channels)
@@ -230,60 +168,23 @@ class Net(nn.Module):
       nn.Conv2d(32, 32, kernel_size=3, padding=1),
       nn.BatchNorm2d(32),
       nn.ReLU(),
-      # nn.AvgPool2d(kernel_size=3, padding=1, stride=2)
     )
-    self.group2_cf = CFBlock3(32)
+    self.group2_cf = SFEBlock(32)
 
     self.group3 = nn.Sequential(
       nn.Conv2d(32, 32, kernel_size=3, padding=1),
       nn.BatchNorm2d(32),
       nn.ReLU(),
-      # nn.AvgPool2d(kernel_size=3, padding=1, stride=2)
     )
-    self.group3_cf = CFBlock3(32)
+    self.group3_cf = SFEBlock(32)
 
     self.group4 = nn.Sequential(
       nn.Conv2d(32, 32, kernel_size=3, padding=1),
       nn.BatchNorm2d(32),
       nn.ReLU(),
-      # nn.AvgPool2d(kernel_size=3, padding=1, stride=2)
     )
-    self.group4_cf = CFBlock3(32)
+    self.group4_cf = SFEBlock(32)
 
-
-    # self.group3 = nn.Sequential(
-    #   nn.Conv2d(32, 32, kernel_size=3, padding=1),
-    #   nn.BatchNorm2d(32),
-    #   nn.ReLU(),
-    #
-    #   nn.Conv2d(32, 64, kernel_size=3, padding=1),
-    #   nn.BatchNorm2d(64),
-    #   nn.ReLU(),
-    #
-    #   nn.AvgPool2d(kernel_size=3, padding=1, stride=2)
-    # )
-    #
-    # self.group4 = nn.Sequential(
-    #   nn.Conv2d(64, 64, kernel_size=3, padding=1),
-    #   nn.BatchNorm2d(64),
-    #   nn.ReLU(),
-    #
-    #   nn.Conv2d(64, 128, kernel_size=3, padding=1),
-    #   nn.BatchNorm2d(128),
-    #   nn.ReLU(),
-    #
-    #   nn.AvgPool2d(kernel_size=3, padding=1, stride=2)
-    # )
-    #
-    # self.group5 = nn.Sequential(
-    #   nn.Conv2d(128, 128, kernel_size=3, padding=1),
-    #   nn.BatchNorm2d(128),
-    #   nn.ReLU(),
-    #
-    #   nn.Conv2d(128, 256, kernel_size=3, padding=1),
-    #   nn.BatchNorm2d(256),
-    #   nn.ReLU(),
-    # )
 
     self.fc2 = nn.Linear(int(128 * (128 + 1) / 2), 256)
     self.bn2 = nn.BatchNorm1d(256)
@@ -311,9 +212,6 @@ class Net(nn.Module):
     x23 = self.group23(x22)
     x2 = self.group2_cf(x23)
 
-    # x3 = x22 + x23
-    # x3 = self.group3(x3)
-    # x3 = self.group3_cf(x3)
     x3 = x22 + x23
     x30 = self.group3(x3)
     x3 = self.group3_cf(x30)
@@ -495,13 +393,9 @@ def evaluate(model, device, eval_loader, epoch, optimizer, best_acc, PARAMS_PATH
   return best_acc
 
 
-def svm_class(model, device, train_loader, eval_loader, best_acc):
+def svm_class(model, device, train_loader, eval_loader):
   model.eval()
 
-  test_loss = 0
-  correct3 = 0
-  correct4 = 0
-  correct5 = 0
   out_train = []
   out_eval = []
   out_train_y = []
@@ -539,7 +433,7 @@ def svm_class(model, device, train_loader, eval_loader, best_acc):
   out_train_y = torch.cat(out_train_y, dim=0).cpu().numpy()
   out_eval = torch.cat(out_eval, dim=0).cpu().numpy()
   out_eval_y = torch.cat(out_eval_y, dim=0).cpu().numpy()
-  clf = svm.SVC(kernel='linear', C=1, gamma='auto')
+  clf = svm.SVC(kernel='rbf', C=5, gamma='auto')
   clf.fit(out_train, out_train_y)
   score = clf.score(out_eval, out_eval_y)
   logging.info('svm accuracy:{:.4f}'.format(score))
@@ -739,7 +633,7 @@ def main(args):
 
   adjust_bn_stats(model, device, train_loader)
   evaluate(model, device, test_loader, epoch, optimizer, best_acc, PARAMS_PATH)
-  svm_class(model, device, train_loader, test_loader, best_acc)
+  svm_class(model, device, train_loader, test_loader)
 
 
 def myParseArgs():
@@ -789,6 +683,7 @@ def myParseArgs():
   args = parser.parse_args()
 
   return args
+
 
 if __name__ == '__main__':
   args = myParseArgs()
