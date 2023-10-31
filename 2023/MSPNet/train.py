@@ -2,31 +2,22 @@
 from sklearn import svm
 import os
 import argparse
-import numpy as np
-import pandas as pd
-import cv2
 from pathlib import Path
-import copy
 import logging
-import random
-import scipy.io as sio
-import matplotlib.pyplot as plt
 import time
-from glob import glob
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data.dataset import Dataset
 from torch.utils.data import DataLoader
 from torchvision import transforms
-import torch.nn.functional as F
 
-#30 SRM filtes
-from srm_filter_kernel import all_normalized_hpf_list
-#Global covariance pooling
-#from MPNCOV.python import MPNCOV
-import MPNCOV
+from LD_loss.PD import LD_loss
+from LD_loss.PD import tramsform
+from dataset.dataset import AugData
+from dataset.dataset import ToTensor
+from dataset.dataset import MyDataset
+from models.model import Model
 
 IMAGE_SIZE = 256
 BATCH_SIZE = 32 // 2
@@ -41,214 +32,6 @@ EVAL_PRINT_FREQUENCY = 1
 DECAY_EPOCH = [80, 140, 180]
 
 OUTPUT_PATH = Path(__file__).stem
-
-def pairedloss(feature1, feature2):
-  distance = torch.abs(feature1 - feature2)
-  distance[distance < 0.01] = 100
-  loss_contrastive = torch.mean(torch.exp(-distance))
-  return loss_contrastive
-
-
-def cs_sc(mr):
-  b, c = mr.size()
-  mr = mr.reshape(int(b / 2), 2, c)
-  mr = torch.transpose(mr, 1, 0)
-  (mra, mrb) = mr.chunk(2, dim=0)
-  mr = torch.cat((mrb, mra), dim=0)
-  mr = torch.transpose(mr, 1, 0)
-  mr = mr.reshape(b, c)
-  return mr
-
-
-#Truncation operation
-class TLU(nn.Module):
-  def __init__(self, threshold):
-    super(TLU, self).__init__()
-
-    self.threshold = threshold
-
-  def forward(self, input):
-    output = torch.clamp(input, min=-self.threshold, max=self.threshold)
-
-    return output
-
-
-class HPF(nn.Module):
-  def __init__(self):
-    super(HPF, self).__init__()
-
-    #Load 30 SRM Filters
-    all_hpf_list_5x5 = []
-
-    for hpf_item in all_normalized_hpf_list:
-      if hpf_item.shape[0] == 3:
-        hpf_item = np.pad(hpf_item, pad_width=((1, 1), (1, 1)), mode='constant')
-
-      all_hpf_list_5x5.append(hpf_item)
-
-    hpf_weight = nn.Parameter(torch.Tensor(all_hpf_list_5x5).view(30, 1, 5, 5), requires_grad=False)
-    self.hpf = nn.Conv2d(1, 30, kernel_size=5, padding=2, bias=False)
-    self.hpf.weight = hpf_weight
-
-    #Truncation, threshold = 3
-    self.tlu = TLU(3.0)
-
-  def forward(self, input):
-
-    output = self.hpf(input)
-    output = self.tlu(output)
-
-    return output
-
-
-class CBR(nn.Module):
-  def __init__(self, in_dim, out_dim):
-    super(CBR, self).__init__()
-
-    self.conv = nn.Conv2d(in_dim, out_dim, kernel_size=3, padding=1, bias=False)
-    self.bn = nn.BatchNorm2d(out_dim)
-    self.act = nn.ReLU()
-
-  def forward(self, x):
-    x = self.conv(x)
-    x = self.bn(x)
-    x = self.act(x)
-
-    return x
-
-
-class SFEBlock(nn.Module):
-  def __init__(self, in_channels):
-    super(SFEBlock, self).__init__()
-
-    self.conv1 = CBR(in_channels, 2 * in_channels)
-    self.conv1s = CBR(2 * in_channels, 2 * in_channels)
-    self.conv2 = CBR(2 * in_channels, 2 * in_channels)
-    self.conv2s = CBR(2 * in_channels, 2 * in_channels)
-    self.conv3 = CBR(2 * in_channels,  4 * in_channels)
-    self.conv3s = CBR(4 * in_channels, 4 * in_channels)
-    self.avg = nn.AvgPool2d(kernel_size=3, padding=1, stride=2)
-
-
-  def forward(self, out):
-    out = self.avg(out)
-    out = self.conv1(out)
-    out = self.conv1s(out)
-    out = self.avg(out)
-    out = self.conv2(out)
-    out = self.conv2s(out)
-    out = self.avg(out)
-    out = self.conv3(out)
-    out = self.conv3s(out)
-    return out
-
-
-class Net(nn.Module):
-  def __init__(self):
-    super(Net, self).__init__()
-
-    self.group1 = HPF()
-
-    self.group20 = nn.Sequential(
-      nn.Conv2d(30, 32, kernel_size=3, padding=1),
-      nn.BatchNorm2d(32),
-      nn.ReLU(),
-    )
-    self.group21 = nn.Sequential(
-      nn.Conv2d(32, 32, kernel_size=3, padding=1),
-      nn.BatchNorm2d(32),
-      nn.ReLU(),
-    )
-    self.group22 = nn.Sequential(
-      nn.Conv2d(32, 32, kernel_size=3, padding=1),
-      nn.BatchNorm2d(32),
-      nn.ReLU(),
-    )
-    self.group23 = nn.Sequential(
-      nn.Conv2d(32, 32, kernel_size=3, padding=1),
-      nn.BatchNorm2d(32),
-      nn.ReLU(),
-    )
-    self.group2_cf = SFEBlock(32)
-
-    self.group3 = nn.Sequential(
-      nn.Conv2d(32, 32, kernel_size=3, padding=1),
-      nn.BatchNorm2d(32),
-      nn.ReLU(),
-    )
-    self.group3_cf = SFEBlock(32)
-
-    self.group4 = nn.Sequential(
-      nn.Conv2d(32, 32, kernel_size=3, padding=1),
-      nn.BatchNorm2d(32),
-      nn.ReLU(),
-    )
-    self.group4_cf = SFEBlock(32)
-
-
-    self.fc2 = nn.Linear(int(128 * (128 + 1) / 2), 256)
-    self.bn2 = nn.BatchNorm1d(256)
-    self.act2 = nn.ReLU()
-    self.fc21 = nn.Linear(256, 2)
-
-    self.fc3 = nn.Linear(int(128 * (128 + 1) / 2), 256)
-    self.bn3 = nn.BatchNorm1d(256)
-    self.act3 = nn.ReLU()
-    self.fc31 = nn.Linear(256, 2)
-
-    self.fc4 = nn.Linear(int(128 * (128 + 1) / 2), 256)
-    self.bn4 = nn.BatchNorm1d(256)
-    self.act4 = nn.ReLU()
-    self.fc41 = nn.Linear(256, 2)
-
-
-  def forward(self, input):
-    x = input
-
-    x = self.group1(x)
-    x20 = self.group20(x)
-    x21 = self.group21(x20)
-    x22 = self.group22(x21)
-    x23 = self.group23(x22)
-    x2 = self.group2_cf(x23)
-
-    x3 = x22 + x23
-    x30 = self.group3(x3)
-    x3 = self.group3_cf(x30)
-
-    x4 = x21 + x30
-    x4 = self.group4(x4)
-    x4 = self.group4_cf(x4)
-
-    x2 = MPNCOV.CovpoolLayer(x2)
-    x2 = MPNCOV.SqrtmLayer(x2, 5)
-    x2 = MPNCOV.TriuvecLayer(x2)
-    x2 = x2.view(x2.size(0), -1)
-    x2 = self.fc2(x2)
-    x2 = self.bn2(x2)
-    x2t = self.act2(x2)
-    x2 = self.fc21(x2t)
-
-    #Global covariance pooling
-    x3 = MPNCOV.CovpoolLayer(x3)
-    x3 = MPNCOV.SqrtmLayer(x3, 5)
-    x3 = MPNCOV.TriuvecLayer(x3)
-    x3 = x3.view(x3.size(0), -1)
-    x3 = self.fc3(x3)
-    x3 = self.bn3(x3)
-    x3t = self.act3(x3)
-    x3 = self.fc31(x3t)
-
-    x4 = MPNCOV.CovpoolLayer(x4)
-    x4 = MPNCOV.SqrtmLayer(x4, 5)
-    x4 = MPNCOV.TriuvecLayer(x4)
-    x4 = x4.view(x4.size(0), -1)
-    x4 = self.fc4(x4)
-    x4 = self.bn4(x4)
-    x4t = self.act4(x4)
-    x4 = self.fc41(x4t)
-
-    return x2, x3, x4, x2t, x3t, x4t
 
 
 class AverageMeter(object):
@@ -294,22 +77,22 @@ def train(model, device, train_loader, optimizer, epoch):
 
     end = time.time()
 
-    out3, out4, out5, out3fc, out4fc, out5fc = model(data)  #FP
+    out1, out2, out3, fv_1, fv_2, fv_3 = model(data)  #FP
 
     criterion = nn.CrossEntropyLoss()
-    loss3 = criterion(out3, label)
-    loss4 = criterion(out4, label)
-    loss5 = criterion(out5, label)
-    out3fc_de = out3fc.detach()
-    out3fc_de = cs_sc(out3fc_de)
-    out4fc_de = out4fc.detach()
-    out4fc_de = cs_sc(out4fc_de)
-    out5fc_de = out5fc.detach()
-    out5fc_de = cs_sc(out5fc_de)
-    loss3_p = pairedloss(out3fc, out3fc_de)
-    loss4_p = pairedloss(out4fc, out4fc_de)
-    loss5_p = pairedloss(out5fc, out5fc_de)
-    loss = loss3 + loss4 + loss5 + 0.9 * (loss3_p + loss4_p + loss5_p)
+    loss_cls1 = criterion(out1, label)
+    loss_cls2 = criterion(out2, label)
+    loss_cls3 = criterion(out3, label)
+    fv_1_de = fv_1.detach()
+    fv_1_de = tramsform(fv_1_de)
+    fv_2_de = fv_2.detach()
+    fv_2_de = tramsform(fv_2_de)
+    fv_3_de = fv_3.detach()
+    fv_3_de = tramsform(fv_3_de)
+    loss_ld1 = LD_loss(fv_1, fv_1_de)
+    loss_ld2 = LD_loss(fv_2, fv_2_de)
+    loss_ld3 = LD_loss(fv_3, fv_3_de)
+    loss = loss_cls1 + loss_cls2 + loss_cls3 + 0.9 * (loss_ld1 + loss_ld2 + loss_ld3)
 
     losses.update(loss.item(), data.size(0))
 
@@ -342,16 +125,15 @@ def adjust_bn_stats(model, device, train_loader):
 
       data, label = data.to(device), label.to(device)
 
-      out3, out4, out5, _, _, _ = model(data)
+      out1, out2, out3, _, _, _ = model(data)
 
 
 def evaluate(model, device, eval_loader, epoch, optimizer, best_acc, PARAMS_PATH):
   model.eval()
 
-  test_loss = 0
+  correct1 = 0
+  correct2 = 0
   correct3 = 0
-  correct4 = 0
-  correct5 = 0
 
   with torch.no_grad():
     for sample in eval_loader:
@@ -363,22 +145,22 @@ def evaluate(model, device, eval_loader, epoch, optimizer, best_acc, PARAMS_PATH
 
       data, label = data.to(device), label.to(device)
 
-      out3, out4, out5, _, _, _ = model(data)
-      pred3 = out3.max(1, keepdim=True)[1]
-      correct3 += pred3.eq(label.view_as(pred3)).sum().item()
+      out1, out2, out3, _, _, _ = model(data)
+      pred1 = out1.max(1, keepdim=True)[1]
+      correct1 += pred1.eq(label.view_as(pred1)).sum().item()
 
-      pred4 = out4.max(1, keepdim=True)[1]
-      correct4 += pred4.eq(label.view_as(pred4)).sum().item()
+      pred4 = out2.max(1, keepdim=True)[1]
+      correct2 += pred4.eq(label.view_as(pred4)).sum().item()
 
-      pred5 = out5.max(1, keepdim=True)[1]
-      correct5 += pred5.eq(label.view_as(pred5)).sum().item()
+      pred5 = out3.max(1, keepdim=True)[1]
+      correct3 += pred5.eq(label.view_as(pred5)).sum().item()
 
-  accuracy = correct5 / (len(eval_loader.dataset) * 2)
+  accuracy1 = correct1 / (len(eval_loader.dataset) * 2)
+  accuracy2 = correct2 / (len(eval_loader.dataset) * 2)
   accuracy3 = correct3 / (len(eval_loader.dataset) * 2)
-  accuracy4 = correct4 / (len(eval_loader.dataset) * 2)
 
-  if accuracy > best_acc and epoch > 180:
-    best_acc = accuracy
+  if accuracy3 > best_acc and epoch > 180:
+    best_acc = accuracy3
     all_state = {
       'original_state': model.state_dict(),
       'optimizer_state': optimizer.state_dict(),
@@ -387,7 +169,7 @@ def evaluate(model, device, eval_loader, epoch, optimizer, best_acc, PARAMS_PATH
     torch.save(all_state, PARAMS_PATH)
   
   logging.info('-' * 8)
-  logging.info('Eval accuracy: s{:.4f},  m{:.4f},  h{:.4f}'.format(accuracy3, accuracy4, accuracy))
+  logging.info('Eval accuracy: s{:.4f},  m{:.4f},  h{:.4f}'.format(accuracy1, accuracy2, accuracy3))
   logging.info('Best accuracy:{:.4f}'.format(best_acc))   
   logging.info('-' * 8)
   return best_acc
@@ -411,8 +193,8 @@ def svm_class(model, device, train_loader, eval_loader):
 
       data, label = data.to(device), label.to(device)
 
-      _, _, _, out3, out4, out5 = model(data)
-      out = torch.cat((out3, out4, out5), dim=1)
+      _, _, _, out1, out2, out3 = model(data)
+      out = torch.cat((out1, out2, out3), dim=1)
       out_train.append(out)
       out_train_y.append(label)
 
@@ -425,17 +207,20 @@ def svm_class(model, device, train_loader, eval_loader):
 
       data, label = data.to(device), label.to(device)
 
-      _, _, _, out3, out4, out5 = model(data)
-      out = torch.cat((out3, out4, out5), dim=1)
+      _, _, _, out1, out2, out3 = model(data)
+      out = torch.cat((out1, out2, out3), dim=1)
       out_eval.append(out)
       out_eval_y.append(label)
+
   out_train = torch.cat(out_train, dim=0).cpu().numpy()
   out_train_y = torch.cat(out_train_y, dim=0).cpu().numpy()
   out_eval = torch.cat(out_eval, dim=0).cpu().numpy()
   out_eval_y = torch.cat(out_eval_y, dim=0).cpu().numpy()
+
   clf = svm.SVC(kernel='rbf', C=5, gamma='auto')
   clf.fit(out_train, out_train_y)
   score = clf.score(out_eval, out_eval_y)
+
   logging.info('svm accuracy:{:.4f}'.format(score))
 
 
@@ -449,72 +234,7 @@ def initWeights(module):
     nn.init.normal_(module.weight.data, mean=0, std=0.01)
     nn.init.constant_(module.bias.data, val=0)
 
-#Data augmentation 
-class AugData():
-  def __call__(self, sample):
-    data, label = sample['data'], sample['label']
-
-    #Rotation
-    rot = random.randint(0,3)
-    data = np.rot90(data, rot, axes=[1, 2]).copy()
-    
-    #Mirroring 
-    if random.random() < 0.5:
-      data = np.flip(data, axis=2).copy()
-
-    new_sample = {'data': data, 'label': label}
-
-    return new_sample
-
-
-class ToTensor():
-  def __call__(self, sample):
-    data, label = sample['data'], sample['label']
-
-    data = np.expand_dims(data, axis=1)
-    data = data.astype(np.float32)
-    # data = data / 255.0
-
-    new_sample = {
-      'data': torch.from_numpy(data),
-      'label': torch.from_numpy(label).long(),
-    }
-
-    return new_sample
-
-
-class MyDataset(Dataset):
-  def __init__(self, DATASET_DIR, transform=None):
-    self.transform = transform
-    
-    self.cover_dir = DATASET_DIR + '/cover'
-    self.stego_dir = DATASET_DIR + '/stego'
-
-    self.cover_list = [x.split('/')[-1] for x in glob(self.cover_dir+'/*')]
-    assert len(self.cover_list) != 0, "cover_dir is empty"
-    
-  def __len__(self):
-    return len(self.cover_list)
-
-  def __getitem__(self, idx):
-    file_index = int(idx)
-
-    cover_path=os.path.join(self.cover_dir,self.cover_list[file_index])
-    stego_path=os.path.join(self.stego_dir,self.cover_list[file_index])
-    
-    cover_data = cv2.imread(cover_path, -1)
-    stego_data = cv2.imread(stego_path, -1)
-
-    data = np.stack([cover_data, stego_data])
-    label = np.array([0, 1], dtype='int32')
-
-    sample = {'data': data, 'label': label}
-
-    if self.transform:
-      sample = self.transform(sample)
-
-    return sample
-
+#Data augmentation
 
 def setLogger(log_path, mode='a'):
   logger = logging.getLogger()
@@ -558,7 +278,7 @@ def main(args):
   #Log files
   PARAMS_NAME = 'model_params' + args.gpuNum + '.pt'
   LOG_NAME = 'model_log' + args.gpuNum
-  print('按gpu序号写入：', PARAMS_NAME, LOG_NAME)
+  print(PARAMS_NAME, LOG_NAME)
   
   PARAMS_PATH = os.path.join(OUTPUT_PATH, PARAMS_NAME)
   LOG_PATH = os.path.join(OUTPUT_PATH, LOG_NAME)
@@ -575,7 +295,7 @@ def main(args):
   valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=False, **kwargs)
   test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, **kwargs)
 
-  model = Net().to(device)
+  model = Model().to(device)
   model.apply(initWeights)
 
   params = model.parameters()
